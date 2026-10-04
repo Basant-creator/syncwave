@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>SyncWave · Speaker</title>
+  <link rel="stylesheet" href="/css/style.css">
+</head>
+<body>
+<main class="wrap narrow">
+  <header class="top">
+    <h1>SYNCWAVE</h1>
+    <div class="room">Room: <strong id="roomId">····</strong></div>
+  </header>
+
+  <section class="card center">
+    <div id="connStatus" class="pill">Connecting…</div>
+
+    <button id="enableBtn" class="primary big">ENABLE SPEAKER</button>
+    <div id="speakerOk" class="ok" hidden>Speaker enabled ✓</div>
+
+    <p class="track">Track: <span id="trackName">—</span></p>
+    <div id="dlProgress" class="progress" hidden><div></div></div>
+
+    <div id="bigStatus" class="big-status">Waiting for Master…</div>
+    <div id="spatialInfo" class="small muted"></div>
+    <div id="testPhase" class="test-phase" hidden></div>
+    <div class="playback"><span id="posText">00:00</span> / <span id="durText">00:00</span></div>
+    <p id="hint" class="muted small">Keep this page open and the screen on while playing.</p>
+  </section>
+
+  <section class="card">
+    <label class="name">Device name
+      <input id="nameInput" maxlength="32" autocomplete="off">
+    </label>
+  </section>
+
+  <section class="card">
+    <h2>Fine-tune timing</h2>
+    <p class="muted small">If this phone sounds early or late compared to the laptop, nudge it.
+      <b>+</b> plays later, <b>−</b> plays earlier. Saved on this phone.</p>
+    <div class="trim">
+      <button data-trim="-10">−10</button>
+      <button data-trim="-1">−1</button>
+      <span id="trimText" class="mono">0 ms</span>
+      <button data-trim="1">+1</button>
+      <button data-trim="10">+10</button>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>Diagnostics</h2>
+    <dl id="diag" class="diag"></dl>
+  </section>
+</main>
+<script src="/js/sync.js"></script>
+<script src="/js/live.js"></script>
+<script src="/js/spatial.js"></script>
+<script src="/js/client.js"></script>
+</body>
+</html>

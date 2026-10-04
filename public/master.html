@@ -1,0 +1,177 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>SyncWave · Master</title>
+  <link rel="stylesheet" href="/css/style.css">
+</head>
+<body>
+<main class="wrap">
+  <header class="top">
+    <h1>SYNCWAVE</h1>
+    <div class="room">Room: <strong id="roomId">····</strong></div>
+    <span id="connStatus" class="pill">Connecting…</span>
+  </header>
+
+  <p id="fatal" class="msg bad" hidden></p>
+
+  <div class="grid">
+    <section class="card join">
+      <img id="qr" alt="QR code to join this room" width="220" height="220">
+      <div class="join-info">
+        <p>Scan with a phone on the <b>same Wi-Fi</b>.</p>
+        <a id="joinUrl" class="mono" target="_blank" rel="noopener"></a>
+        <label id="ifaceWrap" class="small" hidden>
+          Network address
+          <select id="iface"></select>
+        </label>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>Connected Devices</h2>
+      <ul id="deviceList" class="devices"><li class="muted">—</li></ul>
+    </section>
+  </div>
+
+  <section class="card">
+    <h2>Source</h2>
+    <div class="modes">
+      <label class="mode"><input type="radio" name="mode" value="file" checked> Audio file</label>
+      <label class="mode"><input type="radio" name="mode" value="live"> Live from this laptop <span class="muted">(Apple Music, Spotify, YouTube…)</span></label>
+    </div>
+    <label class="check"><input type="checkbox" id="localSpeaker" checked> Play on this laptop too</label>
+    <p id="readyText" class="muted small"></p>
+    <p id="speakerHint" class="msg warn" hidden>Click anywhere on the page to enable this laptop's speaker.</p>
+  </section>
+
+  <section class="card">
+    <h2>Playback Mode</h2>
+    <div class="modes">
+      <label class="mode"><input type="radio" name="pmode" value="standard" checked> Standard Sync <span class="muted">(every device plays the full mix — stable)</span></label>
+      <label class="mode"><input type="radio" name="pmode" value="spatial"> Experimental Spatial <span class="muted">(distributed stereo by device position)</span></label>
+    </div>
+
+    <div id="spatialPanel" hidden>
+      <p class="small help">
+        <b>Experimental distributed stereo.</b> Each device acts as one speaker on a left↔right line and plays a
+        mix of the left/right channels that matches its position. This is <i>not</i> professional spatial audio.
+        Place the phones physically where you assign them.
+      </p>
+
+      <div class="room-strip" id="roomStrip" aria-label="Room layout">
+        <span class="room-label">ROOM</span>
+        <span class="axis left">LEFT −1</span><span class="axis center">0</span><span class="axis right">+1 RIGHT</span>
+      </div>
+
+      <h3 class="sub">Left / Right Position</h3>
+      <div id="positionList" class="positions"></div>
+
+      <label class="field">Spatial Width
+        <input type="range" id="spWidth" min="0" max="1" step="0.05" value="1">
+        <span id="spWidthText" class="mono">1.00</span>
+      </label>
+      <label class="field">Center Mix
+        <input type="range" id="spCenter" min="0" max="1" step="0.05" value="0.3">
+        <span id="spCenterText" class="mono">0.30</span>
+      </label>
+      <p class="muted small">Width scales how far apart the positions act (0 = everyone centered).
+        Center Mix = how much of the full mix every device keeps (1 = all play the same mix).</p>
+
+      <div class="controls">
+        <button id="spApply" class="primary">APPLY</button>
+        <button id="spTest">TEST SPATIAL AUDIO</button>
+      </div>
+      <p id="spMsg" class="msg"></p>
+      <div id="spTestPhase" class="test-phase" hidden></div>
+    </div>
+  </section>
+
+  <div id="fileMode">
+    <section class="card">
+      <h2>Track</h2>
+      <input type="file" id="fileInput" hidden
+             accept="audio/*,.mp3,.wav,.m4a,.aac,.ogg,.oga,.opus,.flac,.webm">
+      <div class="row">
+        <button id="chooseBtn">Choose Audio File</button>
+        <span id="trackName" class="muted">No track selected</span>
+      </div>
+      <div id="uploadProgress" class="progress" hidden><div></div></div>
+      <p id="trackMsg" class="msg"></p>
+    </section>
+
+    <section class="card">
+      <div class="controls">
+        <button id="playBtn" class="primary">PLAY SYNCED</button>
+        <button id="pauseBtn">PAUSE</button>
+        <button id="stopBtn">STOP</button>
+      </div>
+      <input type="range" id="seek" min="0" max="0" step="0.1" value="0" aria-label="Seek">
+      <div class="playback">
+        Playback: <span id="posText">00:00</span> / <span id="durText">00:00</span>
+        <span id="playState" class="muted"></span>
+      </div>
+    </section>
+  </div>
+
+  <section class="card" id="liveMode" hidden>
+    <h2>Live audio</h2>
+    <label class="field">Capture
+      <select id="liveSource">
+        <option value="tab">A browser tab: music.apple.com, Spotify, YouTube… (no install)</option>
+        <option value="device">An audio input: VB-CABLE for the Apple Music app / any app</option>
+        <option value="screen">Whole-system audio (phones only, laptop not in sync)</option>
+        <option value="test">Test clicks (checks sync, no capture needed)</option>
+      </select>
+    </label>
+    <div id="deviceRow" class="row" hidden>
+      <label class="field">Input device <select id="liveDevice"><option value="">Default input</option></select></label>
+      <button id="refreshDevices" type="button">Refresh list</button>
+    </div>
+    <p id="liveHelp" class="small help"></p>
+    <label class="field">Latency buffer
+      <input type="range" id="delay" min="150" max="2000" step="50" value="500">
+      <span id="delayText" class="mono">500 ms</span>
+    </label>
+    <p class="muted small">Every device plays the audio this long after it is captured. Raise it if phones report late chunks; lower it for less delay.</p>
+    <div class="controls">
+      <button id="liveStartBtn" class="primary">START LIVE</button>
+      <button id="liveStopBtn">STOP LIVE</button>
+    </div>
+    <div class="meter" title="Captured audio level"><div id="meterBar"></div></div>
+    <p id="liveMsg" class="msg"></p>
+  </section>
+
+  <section class="card">
+    <h2>Diagnostics</h2>
+    <div class="summary">
+      <div>Spatial Mode: <b id="sumSpatial">OFF</b></div>
+      <div>Sync Status: <b id="sumSync">—</b></div>
+    </div>
+    <p id="sumSyncNote" class="muted small"></p>
+    <div class="table-wrap">
+      <table id="diag">
+        <thead>
+          <tr>
+            <th>Device</th><th>Position</th><th>Connection</th><th>State</th><th>Playback</th>
+            <th>Est. clock offset</th><th>RTT</th><th>Est. drift</th><th>Output latency</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </div>
+    <p class="muted small">
+      <b>Clock offset</b>: master clock − device clock, ± half the best round trip (the error bound).
+      <b>Drift</b>: <i>clock</i> = rate difference between the two clocks in ppm (needs ~20&nbsp;s of samples);
+      <i>playback</i> = what the device is playing minus where the master clock says it should be
+      (ms, + = ahead). Output latency is what the browser reports; Bluetooth latency is usually not included.
+    </p>
+  </section>
+</main>
+<script src="/js/sync.js"></script>
+<script src="/js/live.js"></script>
+<script src="/js/spatial.js"></script>
+<script src="/js/master.js"></script>
+</body>
+</html>
