@@ -40,6 +40,7 @@
     <div class="modes">
       <label class="mode"><input type="radio" name="mode" value="file" checked> Audio file</label>
       <label class="mode"><input type="radio" name="mode" value="live"> Live from this laptop <span class="muted">(Apple Music, Spotify, YouTube…)</span></label>
+      <label class="mode"><input type="radio" name="mode" value="movie"> 🎬 Movie <span class="muted">(video plays on this laptop, phones follow the picture)</span></label>
     </div>
     <label class="check"><input type="checkbox" id="localSpeaker" checked> Play on this laptop too</label>
     <p id="readyText" class="muted small"></p>
@@ -47,7 +48,7 @@
   </section>
 
   <section class="card">
-    <h2>Playback Mode</h2>
+    <h2>Speaker Layout</h2>
     <div class="modes">
       <label class="mode"><input type="radio" name="pmode" value="standard" checked> Standard Sync <span class="muted">(every device plays the full mix — stable)</span></label>
       <label class="mode"><input type="radio" name="pmode" value="spatial"> Experimental Spatial <span class="muted">(distributed stereo by device position)</span></label>
@@ -112,8 +113,110 @@
         Playback: <span id="posText">00:00</span> / <span id="durText">00:00</span>
         <span id="playState" class="muted"></span>
       </div>
+      <label class="check"><input type="checkbox" id="repeat"> Repeat</label>
     </section>
   </div>
+
+  <section class="card" id="movieMode" hidden>
+    <h2>🎬 Movie Sync</h2>
+    <p class="muted small">The video plays here. Every speaker — this laptop's too — plays the movie's sound locked to
+      the picture's timeline, compensating each device's audio latency and correcting drift while you watch.</p>
+    <input type="file" id="movieInput" hidden accept="video/*,.mp4,.m4v,.mov,.webm">
+    <div class="row">
+      <button id="movieChoose">Choose Movie</button>
+      <span id="movieName" class="muted">No movie selected</span>
+    </div>
+    <div class="row small">
+      <span class="muted">No movie at hand? Make an A/V test movie (flash + beep every second):</span>
+      <select id="testLen"><option value="60">1 min</option><option value="600">10 min</option><option value="1800">30 min</option></select>
+      <button id="makeTest" type="button">Generate</button>
+      <a id="testDownload" class="small" hidden>Download it</a>
+    </div>
+    <div id="moviePrep" class="progress" hidden><div></div></div>
+    <p id="movieMsg" class="msg"></p>
+    <div class="video-wrap"><video id="movieVideo" playsinline muted preload="auto"></video></div>
+    <div class="controls">
+      <button id="mPlay" class="primary">▶ PLAY</button>
+      <button id="mPause">❚❚ PAUSE</button>
+      <button id="mBack">−10 s</button>
+      <button id="mFwd">+10 s</button>
+      <label class="field">Speed
+        <select id="mRate"><option value="0.75">0.75×</option><option value="1" selected>1×</option><option value="1.25">1.25×</option><option value="1.5">1.5×</option></select>
+      </label>
+    </div>
+    <input type="range" id="mSeek" min="0" max="0" step="0.1" value="0" aria-label="Movie position">
+    <div class="playback"><span id="mPos">00:00</span> / <span id="mDur">00:00</span> <span id="mState" class="muted"></span></div>
+    <details>
+      <summary class="small">Lip-sync (all speakers vs picture)</summary>
+      <label class="field">Sound offset
+        <input type="range" id="avOffset" min="-150" max="150" step="5" value="0">
+        <span id="avOffsetText" class="mono">0 ms</span>
+      </label>
+      <p class="muted small">Shifts every speaker together (+ = sound later). The sync engine aligns sound to when each frame
+        is <i>sent</i> to the screen; a display's own processing delay (typically 10–30 ms on a laptop panel, more on a TV)
+        isn't visible to the browser. Leave at 0 unless dialogue is consistently early/late on all speakers.</p>
+    </details>
+  </section>
+
+  <section class="card" id="movieDiag" hidden>
+    <h2>Movie Sync diagnostics</h2>
+    <div id="movieDiagHead" class="mono small dev-head"></div>
+    <div class="table-wrap">
+      <table id="movieTable">
+        <thead><tr>
+          <th>Device</th><th>Status</th><th>Audio position</th><th>A/V difference</th><th>Output latency</th>
+          <th>Compensation</th><th>Clock offset</th><th>Network RTT</th><th>Buffer</th><th>Likely issue</th>
+        </tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+    <p class="muted small"><b>A/V difference</b>: sound audible from that device minus the picture's position (smoothed,
+      + = sound early). <b>Compensation</b>: measured/estimated latency correction + fine offset. Values are what each
+      device measures about itself; physical speaker delay is only known where it was measured with the microphone.</p>
+
+    <h3 class="sub">Movie audio calibration</h3>
+    <p class="muted small">Automatic part: every device compensates the output latency its browser reports. Measured part:
+      <b>RE-CALIBRATE</b> plays short test pulses from the laptop and the device and times them with this laptop's
+      microphone; the result is how much later (+) or earlier the device is heard than the laptop, at the laptop.
+      Fine offset is an optional per-device nudge (saved on the device).</p>
+    <div class="table-wrap">
+      <table id="movieCalTable">
+        <thead><tr><th>Device</th><th>Output latency (browser estimate)</th><th>Measured vs laptop</th><th>Fine offset</th><th>Total compensation</th><th></th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>Playback Mode</h2>
+    <div class="modes row">
+      <label class="mode"><input type="radio" name="syncprofile" value="music" checked> Music</label>
+      <label class="mode"><input type="radio" name="syncprofile" value="movie"> Movie</label>
+    </div>
+    <p id="profileHelp" class="muted small"></p>
+  </section>
+
+  <section class="card">
+    <h2>Latency calibration</h2>
+    <p class="muted small">
+      Always automatic: clock sync and the output latency each browser <i>reports</i> are compensated for every
+      device. Latency a browser can't see (common on Android, always with Bluetooth) can only be measured with a
+      microphone: the laptop listens to a short chirp from each device and corrects its timing.
+    </p>
+    <label class="check"><input type="checkbox" id="autoCal"> Auto-calibrate devices with this laptop's microphone
+      <span class="muted small">(short beeps when a phone joins, only while nothing is playing)</span></label>
+    <div class="controls">
+      <button id="calNow">CALIBRATE NOW</button>
+      <button id="syncTest">RUN SYNC TEST</button>
+    </div>
+    <p id="calMsg" class="msg"></p>
+    <div class="table-wrap">
+      <table id="calTable" hidden>
+        <thead><tr><th>Device</th><th>Heard vs laptop</th><th>Chirps heard</th><th>Spread</th><th>Result</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </section>
 
   <section class="card" id="liveMode" hidden>
     <h2>Live audio</h2>
@@ -144,34 +247,40 @@
   </section>
 
   <section class="card">
-    <h2>Diagnostics</h2>
+    <div class="row spread">
+      <h2>Diagnostics</h2>
+      <label class="check small"><input type="checkbox" id="devMode"> Developer mode</label>
+    </div>
     <div class="summary">
       <div>Spatial Mode: <b id="sumSpatial">OFF</b></div>
       <div>Sync Status: <b id="sumSync">—</b></div>
     </div>
     <p id="sumSyncNote" class="muted small"></p>
-    <div class="table-wrap">
-      <table id="diag">
-        <thead>
-          <tr>
-            <th>Device</th><th>Position</th><th>Connection</th><th>State</th><th>Playback</th>
-            <th>Est. clock offset</th><th>RTT</th><th>Est. drift</th><th>Output latency</th>
-          </tr>
-        </thead>
-        <tbody></tbody>
-      </table>
+
+    <div id="devPanel" hidden>
+      <div class="dev-head mono small" id="devHead"></div>
+      <div class="row">
+        <button id="logBtn" type="button">Start CSV log</button>
+        <button id="logDownload" type="button" disabled>Download CSV</button>
+        <span id="logInfo" class="muted small"></span>
+      </div>
+      <div id="devCards" class="dev-cards"></div>
+      <p class="muted small">
+        <b>Clock offset</b>: master clock − device clock (± uncertainty). <b>Audio latency</b>: what the browser
+        reports (already compensated by the scheduler). <b>Calibration</b>: extra shift measured acoustically
+        (or remembered). <b>Effective offset</b>: total shift applied to that device's schedule.
+        <b>Playback drift</b>: measured position − expected position (+ = ahead), raw / smoothed.
+        <b>Correction</b>: playback-rate change being applied right now.
+      </p>
     </div>
-    <p class="muted small">
-      <b>Clock offset</b>: master clock − device clock, ± half the best round trip (the error bound).
-      <b>Drift</b>: <i>clock</i> = rate difference between the two clocks in ppm (needs ~20&nbsp;s of samples);
-      <i>playback</i> = what the device is playing minus where the master clock says it should be
-      (ms, + = ahead). Output latency is what the browser reports; Bluetooth latency is usually not included.
-    </p>
   </section>
 </main>
 <script src="/js/sync.js"></script>
 <script src="/js/live.js"></script>
 <script src="/js/spatial.js"></script>
+<script src="/js/calibration.js"></script>
+<script src="/js/movie.js"></script>
 <script src="/js/master.js"></script>
+<script src="/js/master-movie.js"></script>
 </body>
 </html>

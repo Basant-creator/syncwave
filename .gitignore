@@ -4,3 +4,4 @@ uploads/*
 test-audio/
 npm-debug.log*
 .DS_Store
+logs/

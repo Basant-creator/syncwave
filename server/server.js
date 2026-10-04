@@ -9,6 +9,10 @@
  *   GET  /css/*, /js/*              Static assets
  *   POST /api/rooms/:roomId/track   Master uploads the selected audio file (needs master token)
  *   GET  /media/:trackId            Clients download the current track (Range requests supported)
+ *   GET  /api/rooms/:roomId/sync-log.csv   Master downloads the sync measurement log (needs master token)
+ *   POST /api/rooms/:roomId/movie/:id/pcm  Master uploads extracted movie audio (needs master token)
+ *   GET  /movie-audio/:id           Clients fetch movie audio by time (HTTP Range)
+ *   GET  /vendor/mp4box/*           MP4 demuxer used by the Master page to extract movie audio
  *   WS   /ws                        Room control, clock sync, playback commands, diagnostics
  */
 
@@ -24,6 +28,7 @@ const { WebSocketServer } = require('ws');
 
 const rooms = require('./roomManager');
 const sync = require('./syncEngine');
+const movies = require('./movieStore');
 
 const PORT = Number(process.env.PORT) || 3000;
 const HOST = '0.0.0.0';
@@ -33,6 +38,7 @@ const MAX_UPLOAD_BYTES = 150 * 1024 * 1024; // 150 MB
 const ROOT = path.join(__dirname, '..');
 const PUBLIC_DIR = path.join(ROOT, 'public');
 const UPLOAD_DIR = process.env.UPLOAD_DIR ? path.resolve(process.env.UPLOAD_DIR) : path.join(ROOT, 'uploads');
+const LOG_DIR = process.env.LOG_DIR ? path.resolve(process.env.LOG_DIR) : path.join(ROOT, 'logs');
 
 const AUDIO_TYPES = {
   '.mp3': 'audio/mpeg',
@@ -171,6 +177,10 @@ app.get('/join/:roomId', (req, res) => {
 
 app.use('/css', express.static(path.join(PUBLIC_DIR, 'css'), { index: false }));
 app.use('/js', express.static(path.join(PUBLIC_DIR, 'js'), { index: false }));
+app.use('/vendor/mp4box', express.static(path.join(ROOT, 'node_modules', 'mp4box', 'dist'), {
+  index: false,
+  setHeaders: (res, p) => { if (p.endsWith('.mjs')) res.type('text/javascript'); },
+}));
 
 app.post('/api/rooms/:roomId/track', async (req, res) => {
   const room = rooms.getRoom(req.params.roomId);
@@ -239,6 +249,55 @@ app.get('/media/:trackId', (req, res) => {
   });
 });
 
+// ─── Movie Sync audio ───────────────────────────────────────────────────────
+
+app.post('/api/rooms/:roomId/movie/:movieId/pcm', (req, res) => {
+  const room = rooms.getRoom(req.params.roomId);
+  if (!room || !safeEqual(req.get('x-master-token') || '', room.masterToken)) {
+    return rejectUpload(req, res, 403, 'Only the Master of this room can upload.');
+  }
+  const movie = room.movie;
+  if (!movie || movie.id !== req.params.movieId) return rejectUpload(req, res, 404, 'No such movie.');
+  const frame = Number(req.query.frame);
+  const chunks = [];
+  let size = 0;
+  req.on('data', (c) => {
+    size += c.length;
+    if (size > 8 * 1024 * 1024) { req.destroy(); return; }
+    chunks.push(c);
+  });
+  req.on('end', () => {
+    try {
+      const ready = movies.writeChunk(movie, frame, Buffer.concat(chunks));
+      const now = Date.now();
+      if (!movie.lastProgress || now - movie.lastProgress > 500) {
+        movie.lastProgress = now;
+        rooms.broadcastMovieProgress(room);
+      }
+      res.json({ readyFrames: ready });
+    } catch (err) {
+      res.status(400).json({ error: err.message });
+    }
+  });
+});
+
+app.get('/movie-audio/:movieId', (req, res) => {
+  const id = req.params.movieId;
+  let movie = null;
+  if (/^[0-9a-f]{16}$/.test(id)) for (const r of rooms.allRooms()) if (r.movie && r.movie.id === id) movie = r.movie;
+  if (!movie) return res.status(404).send('Not found');
+  res.sendFile(movie.filePath, { headers: { 'Content-Type': 'application/octet-stream', 'Cache-Control': 'no-store' } });
+});
+
+app.get('/api/rooms/:roomId/sync-log.csv', (req, res) => {
+  const room = rooms.getRoom(req.params.roomId);
+  if (!room || !safeEqual(req.get('x-master-token') || '', room.masterToken)) return res.status(403).send('Forbidden');
+  const log = room.log || room.lastLog;
+  if (!log) return res.status(404).send('No log recorded yet');
+  res.set('Content-Disposition', `attachment; filename="${path.basename(log.file)}"`);
+  res.type('text/csv').sendFile(log.file);
+});
+
 app.use((req, res) => res.status(404).send('Not found'));
 
 // ─── WebSocket ──────────────────────────────────────────────────────────────
@@ -263,6 +322,12 @@ function roomPayload(room, device) {
     playback: room.playback,
     live: room.live,
     spatial: room.spatial,
+    syncProfile: room.syncProfile,
+    movie: movies.publicMovie(room.movie),
+    source: room.source,
+    movieClock: room.movieClock,
+    profile: isMaster ? undefined : device.profile,
+    log: isMaster ? rooms.logInfo(room) : undefined,
   };
 }
 
@@ -296,7 +361,7 @@ const handlers = {
     if (typeof msg.clientId !== 'string' || !CLIENT_ID_RE.test(msg.clientId)) {
       return rooms.send(ws, { type: 'error', code: 'bad-request', message: 'Invalid client id.' });
     }
-    const device = rooms.attachClient(room, msg.clientId, msg.name, ws);
+    const device = rooms.attachClient(room, msg.clientId, msg.name, ws, msg.profile);
     if (!device) return rooms.send(ws, { type: 'error', code: 'room-full', message: 'Room is full.' });
     console.log(`[room ${room.id}] client joined: ${device.name}`);
     rooms.send(ws, roomPayload(room, device));
@@ -358,6 +423,99 @@ const handlers = {
     rooms.broadcast(room, { type: 'spatial-test', startAt: sync.sanitizeStartAt(msg.startAt) });
   },
 
+  // ── Sync quality (all Master-only) ──
+
+  /** Music = relaxed tolerances, Movie = tighter. Devices tune their drift correction to it. */
+  'set-sync-profile': masterOnly((room, msg) => rooms.setSyncProfile(room, msg.profile)),
+
+  /** Repeat on/off. While playing this is a "continuous" update: nobody restarts. */
+  loop: masterOnly((room, msg) => rooms.applyPlayback(room, sync.setLoop(room.playback, msg))),
+
+  /**
+   * Acoustic probe: every listed device plays a short chirp at its given
+   * master-clock times; the Master records them with the laptop microphone.
+   * Probes need a quiet room, so file playback is paused first.
+   */
+  probe: masterOnly((room, msg) => {
+    if (!msg.schedule || typeof msg.schedule !== 'object') return;
+    const schedule = {};
+    for (const [id, times] of Object.entries(msg.schedule).slice(0, 40)) {
+      if (!Array.isArray(times)) continue;
+      schedule[id] = times.filter((t) => typeof t === 'number' && Number.isFinite(t)).slice(0, 50);
+    }
+    if (room.playback.status === 'playing') rooms.applyPlayback(room, sync.pause(room.playback));
+    rooms.broadcast(room, { type: 'probe', kind: msg.kind === 'verify' ? 'verify' : 'calibrate', schedule });
+  }),
+
+  /** Calibration result for one device: shift its schedule by adjustMs. */
+  'calibration-adjust': masterOnly((room, msg) => {
+    if (typeof msg.deviceId !== 'string' || typeof msg.adjustMs !== 'number' || !Number.isFinite(msg.adjustMs)) return;
+    rooms.sendToDevice(room, msg.deviceId, {
+      type: 'calibration',
+      adjustMs: Math.max(-500, Math.min(500, msg.adjustMs)),
+      measuredErrorMs: typeof msg.errorMs === 'number' ? msg.errorMs : null,
+    });
+  }),
+
+  /** Acoustic results, for the CSV log. */
+  'probe-result': masterOnly((room, msg) => {
+    if (!room.log || !Array.isArray(msg.devices)) return;
+    const t = sync.masterNow();
+    for (const r of msg.devices.slice(0, 40)) {
+      if (!r || typeof r.deviceId !== 'string') continue;
+      const d = r.deviceId === 'master' ? room.master : room.clients.get(r.deviceId);
+      room.log.acoustic(msg.kind === 'verify' ? 'verify' : 'calibrate', r, d ? d.name : r.deviceId, t);
+    }
+  }),
+
+  // ── Movie Sync (all Master-only) ──
+
+  /** A movie was selected: create storage for its audio track. */
+  'movie-create': masterOnly((room, msg, ws) => {
+    try {
+      const movie = movies.createMovie(UPLOAD_DIR, msg);
+      if (room.playback.status === 'playing') rooms.applyPlayback(room, sync.stop(room.playback));
+      if (room.live.active) rooms.setLive(room, { active: false });
+      rooms.setMovie(room, movie);
+      rooms.send(ws, { type: 'movie-created', id: movie.id });
+      console.log(`[room ${room.id}] movie: ${movie.name} (${(movie.duration / 60).toFixed(1)} min)`);
+    } catch (err) {
+      rooms.send(ws, { type: 'error', code: 'movie', message: err.message });
+    }
+  }),
+
+  /** All audio uploaded. */
+  'movie-complete': masterOnly((room, msg) => {
+    if (!room.movie || room.movie.id !== msg.id) return;
+    movies.completeMovie(room.movie, msg.frames);
+    rooms.broadcastMovieProgress(room);
+  }),
+
+  /** Which source the room is using; devices pick the matching player. */
+  'set-source': masterOnly((room, msg) => {
+    rooms.setSource(room, msg.source);
+    // Leaving Movie Sync: stop the movie timeline so phones go quiet.
+    if (msg.source !== 'movie' && room.movieClock.playing) {
+      rooms.setMovieClock(room, { ...room.movieClock, epoch: room.movieClock.epoch + 1, playing: false, masterTime: sync.masterNow() });
+    }
+  }),
+
+  'movie-clear': masterOnly((room) => {
+    if (room.movie) rooms.setMovie(room, null);
+  }),
+
+  /** The Master video's timeline (see server/movieStore.js). */
+  'movie-sync': masterOnly((room, msg) => { rooms.setMovieClock(room, msg.clock); }),
+
+  /** Per-device fine offset for movie audio, set from the Master's calibration panel. */
+  'movie-fine': masterOnly((room, msg) => {
+    if (typeof msg.deviceId !== 'string' || typeof msg.fineMs !== 'number' || !Number.isFinite(msg.fineMs)) return;
+    rooms.sendToDevice(room, msg.deviceId, { type: 'movie-fine', fineMs: Math.max(-100, Math.min(100, msg.fineMs)) });
+  }),
+
+  /** CSV sync log on/off. */
+  log: masterOnly((room, msg) => rooms.setLogging(room, msg.enabled === true, LOG_DIR)),
+
   // Master-only playback commands. The result is broadcast to every device,
   // including the Master page itself, which then schedules like everyone else.
   play: masterCommand((room, msg) => sync.play(room.playback, msg)),
@@ -366,11 +524,19 @@ const handlers = {
   stop: masterCommand((room) => sync.stop(room.playback)),
 };
 
+function masterOnly(fn) {
+  return (ws, msg) => {
+    const found = rooms.deviceForSocket(ws);
+    if (found && found.device.role === 'master') fn(found.room, msg, ws);
+  };
+}
+
 function masterCommand(fn) {
   return (ws, msg) => {
     const found = rooms.deviceForSocket(ws);
     if (!found || found.device.role !== 'master') return;
     if (found.room.live.active) rooms.setLive(found.room, { active: false }); // file playback ends live mode
+    if (msg.type === 'play') rooms.setSource(found.room, 'file');
     rooms.applyPlayback(found.room, fn(found.room, msg));
   };
 }
@@ -418,9 +584,13 @@ wss.on('connection', (ws, req) => {
   });
 });
 
-// Push the device list (with diagnostics) to each Master once a second.
+// Push the device list (with diagnostics) to each Master once a second,
+// and append a row per device to the CSV log if it's on.
 setInterval(() => {
-  for (const room of rooms.allRooms()) rooms.sendDevicesToMaster(room);
+  for (const room of rooms.allRooms()) {
+    rooms.sendDevicesToMaster(room);
+    rooms.writeLogRows(room);
+  }
 }, 1000);
 
 // Detect dead sockets (phone went out of range without closing cleanly).
@@ -430,7 +600,7 @@ setInterval(() => {
     ws.isAlive = false;
     ws.ping();
   }
-}, 15000);
+}, 5000);
 
 setInterval(() => rooms.sweep(), 30000);
 

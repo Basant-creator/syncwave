@@ -23,6 +23,7 @@
     <div id="dlProgress" class="progress" hidden><div></div></div>
 
     <div id="bigStatus" class="big-status">Waiting for Master…</div>
+    <div id="syncLine" class="small muted"></div>
     <div id="spatialInfo" class="small muted"></div>
     <div id="testPhase" class="test-phase" hidden></div>
     <div class="playback"><span id="posText">00:00</span> / <span id="durText">00:00</span></div>
@@ -35,10 +36,20 @@
     </label>
   </section>
 
-  <section class="card">
-    <h2>Fine-tune timing</h2>
-    <p class="muted small">If this phone sounds early or late compared to the laptop, nudge it.
-      <b>+</b> plays later, <b>−</b> plays earlier. Saved on this phone.</p>
+  <section class="card" id="movieOffsetCard" hidden>
+    <h2>🎬 Movie audio offset</h2>
+    <p class="muted small">Optional fine adjustment for this phone during movies (saved on this phone). Latency is
+      compensated automatically; use this only if dialogue from this phone is consistently early or late.
+      <b>+</b> plays later.</p>
+    <input type="range" id="movieFine" class="av-slider" min="-100" max="100" step="1" value="0" aria-label="Movie audio offset">
+    <div class="row spread small"><span>−100 ms</span><span>Current: <b id="movieFineText" class="mono">+0 ms</b></span><span>+100 ms</span></div>
+  </section>
+
+  <details class="card">
+    <summary>Manual timing adjustment <span class="muted small">(normally not needed)</span></summary>
+    <p class="muted small">Latency is compensated automatically. Only if this phone still sounds early or
+      late, nudge it here: <b>+</b> plays later, <b>−</b> plays earlier. Added on top of the automatic
+      calibration and saved on this phone.</p>
     <div class="trim">
       <button data-trim="-10">−10</button>
       <button data-trim="-1">−1</button>
@@ -46,16 +57,32 @@
       <button data-trim="1">+1</button>
       <button data-trim="10">+10</button>
     </div>
-  </section>
+  </details>
 
   <section class="card">
     <h2>Diagnostics</h2>
     <dl id="diag" class="diag"></dl>
   </section>
+
+  <section class="card" id="devTools" hidden>
+    <h2>Developer test tools</h2>
+    <p class="muted small">For testing only (this page was opened with <span class="mono">?dev=1</span>).</p>
+    <div class="row">
+      <button id="dropBtn" type="button">Simulate Wi-Fi drop (8 s)</button>
+    </div>
+    <label class="field">Simulated audio-clock skew
+      <input id="skewInput" type="number" step="10" value="0" style="width:90px"> ppm
+      <button id="skewBtn" type="button">Apply</button>
+    </label>
+    <p class="muted small">Skew makes this device's measurements behave like a phone whose audio clock runs
+      fast/slow, to exercise drift correction on one laptop. Its audio is not meaningful while skew ≠ 0.</p>
+  </section>
 </main>
 <script src="/js/sync.js"></script>
 <script src="/js/live.js"></script>
 <script src="/js/spatial.js"></script>
+<script src="/js/calibration.js"></script>
+<script src="/js/movie.js"></script>
 <script src="/js/client.js"></script>
 </body>
 </html>

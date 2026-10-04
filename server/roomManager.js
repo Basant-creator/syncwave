@@ -14,6 +14,8 @@ const crypto = require('node:crypto');
 const fs = require('node:fs');
 const QRCode = require('qrcode');
 const sync = require('./syncEngine');
+const { SyncLog } = require('./syncLog');
+const movies = require('./movieStore');
 
 // No 0/O/1/I so the room code is easy to read aloud.
 const ROOM_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
@@ -73,6 +75,13 @@ async function createRoom(joinBases) {
     live: { active: false },
     // Experimental spatial mode. Independent of playback: only gains change.
     spatial: { enabled: false, width: 1, centerMix: 0.3, positions: { master: 0 } },
+    // Sync tolerance profile: 'music' (relaxed) or 'movie' (tighter). See public/js/sync.js.
+    syncProfile: 'music',
+    log: null,          // SyncLog while CSV logging is on
+    // Movie Sync: extracted movie audio + the Master video's timeline (server/movieStore.js).
+    movie: null,
+    source: 'file',     // 'file' | 'live' | 'movie' — which player the devices should use
+    movieClock: { epoch: 0, playing: false, videoTime: 0, masterTime: 0, rate: 1, avOffsetMs: 0 },
     joinUrls,
   };
   rooms.set(id, room);
@@ -97,7 +106,23 @@ function findTrack(trackId) {
 }
 
 function newDevice(id, role, name) {
-  return { id, role, name, ws: null, connected: false, lastSeen: Date.now(), status: {} };
+  return { id, role, name, ws: null, connected: false, lastSeen: Date.now(), status: {}, profile: {} };
+}
+
+/**
+ * What a phone remembers about itself between sessions (sent on join). Used as
+ * an initial estimate only; the device recalibrates when it looks stale.
+ */
+function cleanProfile(p) {
+  if (!p || typeof p !== 'object') return {};
+  const num = (v, lo, hi) => (typeof v === 'number' && Number.isFinite(v) && v >= lo && v <= hi ? v : null);
+  return {
+    calibrationMs: num(p.calibrationMs, -500, 500),
+    calibratedAt: num(p.calibratedAt, 0, 1e13),
+    calibrationLatencyMs: num(p.calibrationLatencyMs, 0, 2000),
+    lastClockOffsetMs: num(p.lastClockOffsetMs, -1e12, 1e12),
+    manualTrimMs: num(p.manualTrimMs, -1000, 1000),
+  };
 }
 
 function bindSocket(device, ws, room) {
@@ -120,7 +145,7 @@ function attachMaster(room, ws) {
   return room.master;
 }
 
-function attachClient(room, clientId, name, ws) {
+function attachClient(room, clientId, name, ws, profile) {
   let device = room.clients.get(clientId);
   if (!device) {
     if (room.clients.size >= MAX_CLIENTS_PER_ROOM) return null;
@@ -133,6 +158,7 @@ function attachClient(room, clientId, name, ws) {
   } else if (name) {
     device.name = cleanName(name, device.name);
   }
+  if (profile) device.profile = cleanProfile(profile);
   bindSocket(device, ws, room);
   return device;
 }
@@ -170,36 +196,95 @@ function renameDevice(device, name) {
   device.name = cleanName(name, device.name);
 }
 
+const STATUS_NUMBERS = [
+  'reportedAt', 'loadProgress', 'position', 'duration', 'offsetMs', 'rttMs', 'bestRttMs',
+  'clockUncertaintyMs', 'clockSamples', 'lastSyncAgeMs', 'clockDriftPpm', 'playbackDriftMs',
+  'smoothedDriftMs', 'correctionRate', 'skewBiasPpm', 'resyncs', 'outputLatencyMs', 'calibrationMs',
+  'manualTrimMs', 'trimMs', 'calibratedAt', 'liveBufferMs', 'liveLate', 'liveResyncs',
+  'spatialX', 'gainL', 'gainR', 'reconnects',
+  // Movie Sync
+  'movieEpoch', 'movieAudioPos', 'movieErrorMs', 'movieSmoothedMs', 'movieRate', 'movieBufferS',
+  'movieResyncs', 'movieUnderruns', 'movieFineMs', 'movieExpectedPos',
+];
+const STATUS_STRINGS = {
+  state: 32, syncState: 16, trackId: 32, timingMethod: 24, correctionZone: 16,
+  calibrationSource: 24, error: 160, movieState: 16, movieZone: 16,
+};
+const STATUS_BOOLEANS = ['speakerEnabled', 'spatialOn', 'calibrating'];
+
 /** Copy only known fields with sane types from a device's status report. */
 function updateStatus(device, s) {
   if (!s || typeof s !== 'object') return;
-  const num = (v) => (typeof v === 'number' && Number.isFinite(v) ? v : null);
-  const str = (v, n) => (typeof v === 'string' ? v.slice(0, n) : null);
-  device.status = {
-    reportedAt: num(s.reportedAt),
-    state: str(s.state, 32),
-    speakerEnabled: s.speakerEnabled === true,
-    trackId: str(s.trackId, 32),
-    loadProgress: num(s.loadProgress),
-    position: num(s.position),
-    duration: num(s.duration),
-    offsetMs: num(s.offsetMs),
-    rttMs: num(s.rttMs),
-    clockDriftPpm: num(s.clockDriftPpm),
-    playbackDriftMs: num(s.playbackDriftMs),
-    outputLatencyMs: num(s.outputLatencyMs),
-    timingMethod: str(s.timingMethod, 24),
-    trimMs: num(s.trimMs),
-    liveBufferMs: num(s.liveBufferMs),
-    liveLate: num(s.liveLate),
-    liveResyncs: num(s.liveResyncs),
-    spatialOn: s.spatialOn === true,
-    spatialX: num(s.spatialX),
-    gainL: num(s.gainL),
-    gainR: num(s.gainR),
-    error: str(s.error, 160),
-  };
+  const out = {};
+  for (const k of STATUS_NUMBERS) out[k] = typeof s[k] === 'number' && Number.isFinite(s[k]) ? s[k] : null;
+  for (const [k, n] of Object.entries(STATUS_STRINGS)) out[k] = typeof s[k] === 'string' ? s[k].slice(0, n) : null;
+  for (const k of STATUS_BOOLEANS) out[k] = s[k] === true;
+  device.status = out;
   device.lastSeen = Date.now();
+  // Keep the server's copy of the profile current (survives the phone reloading).
+  if (out.calibrationMs != null) device.profile.calibrationMs = out.calibrationMs;
+}
+
+function sendToDevice(room, deviceId, msg) {
+  const d = deviceId === 'master' ? room.master : room.clients.get(deviceId);
+  if (d) send(d.ws, msg);
+  return !!d;
+}
+
+function setSyncProfile(room, name) {
+  if (name !== 'music' && name !== 'movie') return;
+  room.syncProfile = name;
+  broadcast(room, { type: 'sync-profile', profile: name });
+}
+
+// ─── Movie Sync ─────────────────────────────────────────────────────────────
+
+function setSource(room, source) {
+  if (!['file', 'live', 'movie'].includes(source) || room.source === source) return;
+  room.source = source;
+  broadcast(room, { type: 'source', source });
+}
+
+function setMovie(room, movie) {
+  movies.deleteMovie(room.movie);
+  room.movie = movie;
+  if (movie) setSource(room, 'movie');
+  room.movieClock = { epoch: room.movieClock.epoch + 1, playing: false, videoTime: 0, masterTime: 0, rate: 1, avOffsetMs: room.movieClock.avOffsetMs };
+  broadcast(room, { type: 'movie', movie: movies.publicMovie(movie) });
+  broadcast(room, { type: 'movie-clock', clock: room.movieClock });
+}
+
+function broadcastMovieProgress(room) {
+  broadcast(room, { type: 'movie', movie: movies.publicMovie(room.movie) });
+}
+
+/** Accept a timeline update from the Master's video and relay it to everyone. */
+function setMovieClock(room, clock) {
+  const c = movies.cleanClock(clock, room.movieClock.epoch);
+  if (!c) return false;
+  room.movieClock = c;
+  broadcast(room, { type: 'movie-clock', clock: c });
+  return true;
+}
+
+/** Start/stop the CSV sync log for a room. */
+function setLogging(room, enabled, dir) {
+  if (enabled && !room.log) room.log = new SyncLog(dir, room.id);
+  if (!enabled && room.log) { room.log.stop(); room.log.stopped = room.log.info(); room.lastLog = room.log; room.log = null; }
+  if (room.master) send(room.master.ws, { type: 'log-status', log: logInfo(room) });
+}
+
+function logInfo(room) {
+  if (room.log) return room.log.info();
+  if (room.lastLog) return { ...room.lastLog.info(), enabled: false };
+  return { enabled: false };
+}
+
+/** Called once a second: one CSV row per connected device. */
+function writeLogRows(room) {
+  if (!room.log) return;
+  const t = sync.masterNow();
+  for (const d of [room.master, ...room.clients.values()]) if (d && d.connected) room.log.status(d, t);
 }
 
 function deleteTrackFile(track) {
@@ -257,6 +342,7 @@ function setSpatial(room, cfg) {
 /** Turn live mode on/off. Live mode and file playback are exclusive. */
 function setLive(room, live) {
   room.live = live;
+  if (live.active) setSource(room, 'live');
   if (live.active && room.playback.status !== 'stopped') applyPlayback(room, sync.stop(room.playback));
   broadcast(room, { type: 'live', live });
 }
@@ -288,6 +374,7 @@ function devicesSnapshot(room) {
     connected: d.connected,
     lastSeen: d.lastSeen,
     status: d.status,
+    profile: d.profile,
   });
   if (room.master) add(room.master);
   for (const d of room.clients.values()) add(d);
@@ -312,7 +399,7 @@ function broadcast(room, msg) {
 
 function sendDevicesToMaster(room) {
   if (room.master && room.master.connected) {
-    send(room.master.ws, { type: 'devices', devices: devicesSnapshot(room), serverTime: sync.masterNow() });
+    send(room.master.ws, { type: 'devices', devices: devicesSnapshot(room), serverTime: sync.masterNow(), log: logInfo(room) });
   }
 }
 
@@ -322,6 +409,8 @@ function closeRoom(room) {
     if (d && d.ws) { d.ws.syncwave = null; try { d.ws.close(4001, 'room closed'); } catch { /* ignore */ } }
   }
   deleteTrackFile(room.track);
+  movies.deleteMovie(room.movie);
+  if (room.log) room.log.stop();
   rooms.delete(room.id);
 }
 
@@ -366,6 +455,15 @@ module.exports = {
   relayLiveChunk,
   setSpatial,
   broadcast,
+  sendToDevice,
+  setSyncProfile,
+  setMovie,
+  setMovieClock,
+  setSource,
+  broadcastMovieProgress,
+  setLogging,
+  logInfo,
+  writeLogRows,
   publicTrack,
   sendDevicesToMaster,
   send,

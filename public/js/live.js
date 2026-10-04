@@ -183,6 +183,7 @@
         driftMs: this.next !== null ? this.errAvg * 1000 : null,
         late: this.late,
         resyncs: this.resyncs,
+        rate: this.rate,
       };
     }
   }

@@ -48,18 +48,26 @@ function masterNow() {
 }
 
 function createPlayback() {
-  return { status: 'stopped', trackId: null, startAt: 0, position: 0, seq: 0 };
+  return { status: 'stopped', trackId: null, startAt: 0, position: 0, seq: 0, loop: false, duration: null };
+}
+
+function wrap(pos, playback) {
+  return playback.loop && playback.duration > 0 ? pos % playback.duration : pos;
 }
 
 /** Track position (seconds) the room should be at, at master-clock time `t`. */
 function positionAt(playback, t = masterNow()) {
   if (playback.status !== 'playing') return playback.position;
   // Before startAt the devices are waiting; position stays at the cue point.
-  return playback.position + Math.max(0, t - playback.startAt) / 1000;
+  return wrap(playback.position + Math.max(0, t - playback.startAt) / 1000, playback);
 }
 
 function isValidPosition(p) {
   return typeof p === 'number' && Number.isFinite(p) && p >= 0 && p < 24 * 3600;
+}
+
+function isValidDuration(d) {
+  return typeof d === 'number' && Number.isFinite(d) && d > 0 && d < 24 * 3600;
 }
 
 /**
@@ -75,8 +83,10 @@ function sanitizeStartAt(startAt, now = masterNow()) {
 
 // Each command returns a new playback object (with seq bumped) or null if it
 // was invalid. The room manager stores and broadcasts the result.
+// `continuous: true` marks a state that describes the SAME timeline as before
+// (devices keep playing instead of restarting); every other command clears it.
 
-function play(prev, { startAt, position }) {
+function play(prev, { startAt, position, loop, duration }) {
   if (!prev.trackId) return null;
   const pos = isValidPosition(position) ? position : positionAt(prev);
   return {
@@ -85,12 +95,15 @@ function play(prev, { startAt, position }) {
     startAt: sanitizeStartAt(startAt),
     position: pos,
     seq: prev.seq + 1,
+    loop: typeof loop === 'boolean' ? loop : prev.loop,
+    duration: isValidDuration(duration) ? duration : prev.duration,
+    continuous: false,
   };
 }
 
 function pause(prev) {
   if (prev.status !== 'playing') return null;
-  return { ...prev, status: 'paused', position: positionAt(prev), startAt: 0, seq: prev.seq + 1 };
+  return { ...prev, status: 'paused', position: positionAt(prev), startAt: 0, seq: prev.seq + 1, continuous: false };
 }
 
 function seek(prev, { position }) {
@@ -99,15 +112,31 @@ function seek(prev, { position }) {
     // Seeking while playing is a re-scheduled play from the new position.
     return play(prev, { startAt: masterNow() + DEFAULT_LEAD_MS, position });
   }
-  return { ...prev, status: 'paused', position, startAt: 0, seq: prev.seq + 1 };
+  return { ...prev, status: 'paused', position, startAt: 0, seq: prev.seq + 1, continuous: false };
 }
 
 function stop(prev) {
-  return { ...prev, status: 'stopped', position: 0, startAt: 0, seq: prev.seq + 1 };
+  return { ...prev, status: 'stopped', position: 0, startAt: 0, seq: prev.seq + 1, continuous: false };
+}
+
+/**
+ * Turn Repeat on/off. While playing, the timeline is re-anchored at "now"
+ * (same audio, same moment) and marked continuous, so nobody restarts.
+ */
+function setLoop(prev, { loop, duration }) {
+  if (typeof loop !== 'boolean') return null;
+  const dur = isValidDuration(duration) ? duration : prev.duration;
+  if (prev.status === 'playing') {
+    const now = masterNow();
+    if (now < prev.startAt) return { ...prev, loop, duration: dur, seq: prev.seq + 1, continuous: true };
+    const next = { ...prev, loop, duration: dur };
+    return { ...next, startAt: now, position: positionAt(prev, now), seq: prev.seq + 1, continuous: true };
+  }
+  return { ...prev, loop, duration: dur, seq: prev.seq + 1, continuous: false };
 }
 
 function setTrack(prev, trackId) {
-  return { status: 'stopped', trackId, startAt: 0, position: 0, seq: prev.seq + 1 };
+  return { ...createPlayback(), trackId, seq: prev.seq + 1, loop: prev.loop };
 }
 
 /**
@@ -129,6 +158,7 @@ module.exports = {
   pause,
   seek,
   stop,
+  setLoop,
   setTrack,
   syncReply,
 };

@@ -12,7 +12,7 @@
 
   const {
     Connection, ClockSync, SyncedPlayer, LiveReceiver, LiveCapture,
-    SpatialRenderer, SpatialTest, SPATIAL_DEFAULTS,
+    SpatialRenderer, SpatialTest, SPATIAL_DEFAULTS, Calibration, SYNC_PROFILES,
     formatTime, decodeAudio, buildStatus, renderScheduler,
   } = window.SyncWave;
   const $ = (id) => document.getElementById(id);
@@ -65,6 +65,10 @@
     },
   });
 
+  // Hooks for public/js/master-movie.js (Movie Sync), which loads after this file.
+  const api = { handlers: {}, extraStatus: null, onModeChange: null };
+  window.SyncWaveMasterAPI = api;
+
   // ── Session persistence: a reload of this tab keeps the same room ──
 
   function loadSaved() {
@@ -106,8 +110,22 @@
         renderRoom();
         handleTrack(msg.track);
         player.applyPlayback(msg.playback);
+        $('repeat').checked = !!(msg.playback && msg.playback.loop);
         applyLive(msg.live);
         applySpatial(msg.spatial);
+        setSyncProfile(msg.syncProfile);
+        applyLogInfo(msg.log);
+        if (api.handlers.room) api.handlers.room(msg);
+        break;
+      case 'sync-profile':
+        setSyncProfile(msg.profile);
+        break;
+      case 'log-status':
+        applyLogInfo(msg.log);
+        break;
+      case 'probe':
+        // The laptop plays its own reference chirps like every other device.
+        Calibration.scheduleChirps(player, msg.schedule && msg.schedule.master);
         break;
       case 'live':
         applyLive(msg.live);
@@ -128,12 +146,20 @@
         break;
       case 'devices':
         devices = msg.devices;
+        if (msg.log) applyLogInfo(msg.log);
         renderDevices();
         break;
       case 'room-closed':
         clearSaved(); // the socket closes next; on reconnect we create a fresh room
         break;
+      case 'movie':
+      case 'movie-created':
+      case 'movie-clock':
+      case 'source':
+        if (api.handlers[msg.type]) api.handlers[msg.type](msg);
+        break;
       case 'error':
+        if (msg.code === 'movie' && api.handlers.error) { api.handlers.error(msg); break; }
         if (msg.code === 'room-gone') {
           clearSaved();
           conn.send({ type: 'create-room' });
@@ -266,7 +292,8 @@
     const pb = player.playback;
     if (!pb) return 0;
     if (pb.status !== 'playing') return pb.position;
-    return pb.position + Math.max(0, clock.masterNow() - pb.startAt) / 1000;
+    const pos = pb.position + Math.max(0, clock.masterNow() - pb.startAt) / 1000;
+    return pb.loop && pb.duration ? pos % pb.duration : pos;
   }
 
   /**
@@ -284,8 +311,40 @@
 
   function sendPlay(position) {
     // ★ The scheduled start: "play `position` at master time `startAt`".
-    conn.send({ type: 'play', startAt: clock.masterNow() + leadTimeMs(), position });
+    conn.send({
+      type: 'play', startAt: clock.masterNow() + leadTimeMs(), position,
+      loop: $('repeat').checked, duration: player.duration || undefined,
+    });
   }
+
+  // Repeat: applied to the next play, or right away (without restarting) while playing.
+  $('repeat').addEventListener('change', () => {
+    const pb = player.playback;
+    if (pb && pb.status === 'playing') {
+      conn.send({ type: 'loop', loop: $('repeat').checked, duration: player.duration || undefined });
+    }
+  });
+
+  // ── Playback Mode: Music / Movie (sync tolerances) ──
+
+  const PROFILE_HELP = {
+    music: 'Music: ignores timing errors under 10 ms, corrects 10–50 ms with ≤ 0.15 % playback-rate changes, ' +
+      'up to 0.4 % beyond that, and resyncs only above 200 ms.',
+    movie: 'Movie: tighter, because dialogue makes timing errors obvious. Ignores errors under 4 ms, corrects ' +
+      'with ≤ 0.2 % rate changes (0.5 % above 25 ms) and resyncs above 80 ms.',
+  };
+  let syncProfile = 'music';
+  function setSyncProfile(name) {
+    if (!SYNC_PROFILES[name]) return;
+    syncProfile = name;
+    player.setSyncProfile(name);
+    const radio = document.querySelector(`input[name="syncprofile"][value="${name}"]`);
+    if (radio) radio.checked = true;
+    $('profileHelp').textContent = PROFILE_HELP[name];
+  }
+  document.querySelectorAll('input[name="syncprofile"]').forEach((r) => {
+    r.addEventListener('change', () => conn.send({ type: 'set-sync-profile', profile: r.value }));
+  });
 
   $('playBtn').addEventListener('click', () => {
     const pb = player.playback;
@@ -489,22 +548,28 @@
     const connected = devices.filter((d) => d.connected);
     const pb = player.playback;
     const roomPlaying = (pb && pb.status === 'playing') || live.active;
-    if (!roomPlaying) return { text: 'IDLE (nothing playing)', cls: '', note: '' };
+    const tol = SYNC_PROFILES[syncProfile].syncedMs;
+    const clients = connected.filter((d) => d.role === 'client');
+    const measured = clients.filter((d) => d.status && d.status.calibrationSource === 'acoustic').length;
+    const calNote = clients.length
+      ? ` Acoustic calibration: ${measured}/${clients.length} phones measured this session${measured < clients.length ? ' (the rest rely on browser-reported latency only)' : ''}.`
+      : '';
+    if (!roomPlaying) return { text: 'IDLE (nothing playing)', cls: '', note: calNote.trim() };
     const playing = connected.filter((d) => d.status && (d.status.state === 'playing' || d.status.state === 'live'));
-    if (playing.length === 0) return { text: 'NOT PLAYING YET', cls: 'warn', note: '' };
-    const errs = playing.map((d) => Math.abs(d.status.playbackDriftMs)).filter(Number.isFinite);
-    if (errs.length === 0) return { text: 'MEASURING…', cls: '', note: '' };
+    if (playing.length === 0) return { text: 'NOT PLAYING YET', cls: 'warn', note: calNote.trim() };
+    const errs = playing.map((d) => Math.abs(d.status.smoothedDriftMs ?? d.status.playbackDriftMs)).filter(Number.isFinite);
+    if (errs.length === 0) return { text: 'MEASURING…', cls: '', note: calNote.trim() };
     const worst = Math.max(...errs);
-    const worstRtt = Math.max(0, ...playing.map((d) => d.status.rttMs || 0));
-    let text = worst <= 5 ? 'SYNCED' : worst <= 20 ? 'ROUGHLY SYNCED' : 'OUT OF SYNC';
-    let cls = worst <= 5 ? 'ok' : worst <= 20 ? 'warn' : 'bad';
+    const worstUnc = Math.max(0, ...playing.map((d) => d.status.clockUncertaintyMs || 0));
+    const states = playing.map((d) => d.status.syncState);
+    let text = worst <= tol ? 'SYNCED' : states.includes('RESYNCING') ? 'RESYNCING' : 'DRIFTING (correcting)';
+    let cls = worst <= tol ? 'ok' : 'warn';
     if (playing.length < connected.length) {
       text += ` — only ${playing.length}/${connected.length} devices playing`;
       cls = 'warn';
     }
-    const note = `Worst reported timing error: ${worst.toFixed(1)} ms (each device's estimate against the master clock; ` +
-      `clock-offset uncertainty up to ~${(worstRtt / 2).toFixed(1)} ms). Speaker/acoustic latency is NOT measured — ` +
-      `trust your ears.${worst > 20 ? ' Press PLAY SYNCED to re-align.' : ''}`;
+    const note = `Worst device error vs the master timeline: ${worst.toFixed(1)} ms (smoothed; tolerance ±${tol} ms in ` +
+      `${SYNC_PROFILES[syncProfile].label} mode). Clock-offset uncertainty up to ~${worstUnc.toFixed(1)} ms.${calNote}`;
     return { text, cls, note };
   }
 
@@ -516,6 +581,260 @@
     $('sumSync').textContent = s.text;
     $('sumSync').className = s.cls;
     $('sumSyncNote').textContent = s.note;
+  }
+
+  // ── Latency calibration (acoustic, laptop microphone) ──
+  //
+  // Software calibration happens on every device by itself (clock sync +
+  // browser-reported output latency). This part measures what software
+  // can't: each device's real audible offset, heard by the laptop's mic.
+  // See public/js/calibration.js for the method.
+
+  const pref = {
+    get(k) { try { return localStorage.getItem(`syncwave.${k}`); } catch { return null; } },
+    set(k, v) { try { localStorage.setItem(`syncwave.${k}`, v); } catch { /* ignore */ } },
+  };
+  const recorder = new Calibration.MicRecorder(player);
+  const calAttempts = new Map();   // deviceId → { count, lastAt } (auto mode doesn't nag forever)
+  const calResults = new Map();    // deviceId → last measured row
+  let probeRunning = false;
+
+  function setCalMsg(text, cls) {
+    const el = $('calMsg');
+    el.textContent = text || '';
+    el.className = `msg ${cls || ''}`;
+  }
+
+  function micError(err) {
+    if (err && err.name === 'NotAllowedError') return 'Microphone access was blocked. Allow it in the browser (address bar icon) to use acoustic calibration.';
+    if (err && err.name === 'NotFoundError') return 'No microphone found on this laptop — acoustic calibration is unavailable (software calibration still runs).';
+    return `Microphone unavailable: ${err ? err.message : 'unknown error'}`;
+  }
+
+  const deviceName = (id) => (devices.find((d) => d.id === id) || { name: id }).name;
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+  /** Candidates: connected phones with their speaker on and a settled clock. */
+  function calibratableIds() {
+    return devices
+      .filter((d) => d.role === 'client' && d.connected && d.status && d.status.speakerEnabled && (d.status.clockSamples || 0) >= 10)
+      .map((d) => d.id);
+  }
+
+  /**
+   * kind 'calibrate': measure, send each device its correction, then measure
+   * again to verify (up to 2 passes). kind 'verify' (sync test): 5 chirps per
+   * device, measure only.
+   */
+  async function runAcoustic(kind, deviceIds) {
+    if (probeRunning) return;
+    if (deviceIds.length === 0) { setCalMsg('No phones ready to measure (they need Enable Speaker tapped).', 'warn'); return; }
+    if (live.active) { setCalMsg('Stop live mode first — the measurement needs a quiet room.', 'warn'); return; }
+    if (!player.speakerEnabled) { setCalMsg('Click anywhere on this page first so the laptop can play its reference chirp.', 'warn'); return; }
+    try { await recorder.open(); } catch (err) { setCalMsg(micError(err), 'bad'); return; }
+    probeRunning = true;
+    render();
+    const ids = ['master', ...deviceIds];
+    const passes = kind === 'calibrate' ? 2 : 1;
+    let failed = false;
+    try {
+      for (let pass = 1; pass <= passes; pass++) {
+        setCalMsg(`${kind === 'calibrate' ? 'Calibrating' : 'Sync test'}: listening to ${ids.length} devices` +
+          `${passes > 1 ? ` (pass ${pass}/${passes})` : ''}… keep the room quiet.`, 'warn');
+        const result = await Calibration.runProbe({
+          send: (m) => conn.send(m), clock, player, recorder, deviceIds: ids, rounds: kind === 'verify' ? 5 : 3, kind,
+        });
+        if (!result.ok) { setCalMsg(result.reason, 'bad'); failed = true; break; }
+        const rows = result.devices.filter((d) => d.deviceId !== 'master');
+        for (const r of rows) {
+          if (kind === 'calibrate' && r.reliable) {
+            r.adjustMs = -r.errorMs;
+            conn.send({ type: 'calibration-adjust', deviceId: r.deviceId, adjustMs: r.adjustMs, errorMs: r.errorMs });
+            r.action = Math.abs(r.adjustMs) < 0.5 ? 'aligned ✓' : `corrected by ${signed(r.adjustMs, 1)} ms`;
+          } else if (!r.reliable) {
+            r.action = r.heard === 0 ? 'not heard — volume up / move closer' : 'inconsistent — try again';
+          } else {
+            r.action = Math.abs(r.errorMs) <= SYNC_PROFILES[syncProfile].syncedMs ? 'within tolerance ✓' : 'outside tolerance';
+          }
+          calResults.set(r.deviceId, { ...r, kind, pass, at: Date.now() });
+        }
+        conn.send({ type: 'probe-result', kind, devices: rows });
+        renderCalTable();
+        const done = rows.every((r) => !r.reliable || Math.abs(r.errorMs) <= 2);
+        if (kind !== 'calibrate' || done) break;
+        await sleep(500); // let the corrections land before verifying
+      }
+      const measured = [...calResults.values()].filter((r) => deviceIds.includes(r.deviceId) && r.reliable);
+      if (failed) {
+        // message already shown
+      } else if (measured.length) {
+        const worst = Math.max(...measured.map((r) => Math.abs(r.errorMs)));
+        setCalMsg(`${kind === 'calibrate' ? 'Calibration' : 'Sync test'} done: ${measured.length}/${deviceIds.length} devices measured; ` +
+          `largest audible offset vs laptop in the last pass: ${worst.toFixed(1)} ms.`, 'ok');
+      } else {
+        setCalMsg('No device was heard clearly. Turn phone volume up, move phones closer to the laptop, and keep the room quiet.', 'bad');
+      }
+    } catch (err) {
+      setCalMsg(`Measurement failed: ${err.message}`, 'bad');
+    } finally {
+      probeRunning = false;
+      render();
+    }
+  }
+
+  function renderCalTable() {
+    const tbody = $('calTable').querySelector('tbody');
+    tbody.innerHTML = '';
+    for (const r of calResults.values()) {
+      const tr = document.createElement('tr');
+      const err = r.errorMs == null ? '—' : `${signed(r.errorMs, 1)} ms ${r.errorMs > 0 ? '(later)' : '(earlier)'}`;
+      for (const c of [deviceName(r.deviceId), err, `${r.heard}/${r.total}`, r.spreadMs == null ? '—' : `${r.spreadMs.toFixed(1)} ms`, r.action]) {
+        const td = document.createElement('td');
+        td.textContent = c;
+        tr.appendChild(td);
+      }
+      tbody.appendChild(tr);
+    }
+    $('calTable').hidden = calResults.size === 0;
+  }
+
+  $('calNow').addEventListener('click', () => runAcoustic('calibrate', calibratableIds()));
+  $('syncTest').addEventListener('click', () => runAcoustic('verify', calibratableIds()));
+
+  $('autoCal').checked = pref.get('autoCal') === '1';
+  $('autoCal').addEventListener('change', async (e) => {
+    pref.set('autoCal', e.target.checked ? '1' : '0');
+    if (!e.target.checked) return;
+    try {
+      await recorder.open();
+      setCalMsg('Microphone ready. Phones are calibrated automatically when they join (while nothing is playing).', 'ok');
+    } catch (err) {
+      e.target.checked = false;
+      pref.set('autoCal', '0');
+      setCalMsg(micError(err), 'bad');
+    }
+  });
+
+  // Auto mode: calibrate devices that haven't been measured this session,
+  // only while the room is quiet; give up on a device after 3 tries.
+  setInterval(() => {
+    if (!$('autoCal').checked || probeRunning || !player.speakerEnabled) return;
+    const pb = player.playback;
+    if ((pb && pb.status === 'playing') || live.active) return;
+    const now = Date.now();
+    const need = devices.filter((d) => {
+      const s = d.status || {};
+      if (d.role !== 'client' || !d.connected || !s.speakerEnabled || (s.clockSamples || 0) < 10) return false;
+      if (s.calibrationSource === 'acoustic') return false;
+      const a = calAttempts.get(d.id);
+      return !a || (a.count < 3 && now - a.lastAt > 60000);
+    });
+    if (!need.length) return;
+    for (const d of need) {
+      const a = calAttempts.get(d.id) || { count: 0 };
+      calAttempts.set(d.id, { count: a.count + 1, lastAt: now });
+    }
+    runAcoustic('calibrate', need.map((d) => d.id));
+  }, 2000);
+
+  // ── Developer diagnostics + CSV log ──
+
+  let logInfo = { enabled: false };
+  function applyLogInfo(info) {
+    if (!info) return;
+    logInfo = info;
+    $('logBtn').textContent = info.enabled ? 'Stop CSV log' : 'Start CSV log';
+    $('logDownload').disabled = !info.file;
+    $('logInfo').textContent = info.file
+      ? `${info.enabled ? 'Recording' : 'Stopped'}: ${info.file} (${info.rows} rows)`
+      : 'One row per device per second: timestamp, device, clock offset, latency, drift, correction, …';
+  }
+  $('logBtn').addEventListener('click', () => conn.send({ type: 'log', enabled: !logInfo.enabled }));
+  $('logDownload').addEventListener('click', async () => {
+    const res = await fetch(`/api/rooms/${room.roomId}/sync-log.csv`, { headers: { 'X-Master-Token': room.token } });
+    if (!res.ok) return;
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(await res.blob());
+    a.download = logInfo.file || 'sync-log.csv';
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+  });
+
+  $('devMode').checked = pref.get('devMode') === '1';
+  $('devMode').addEventListener('change', (e) => {
+    pref.set('devMode', e.target.checked ? '1' : '0');
+    renderDevPanel();
+  });
+
+  const fmtMs = (v, digits = 1, sign = false) => (v == null || !Number.isFinite(v) ? '—' : `${sign ? signed(v, digits) : v.toFixed(digits)} ms`);
+  const CAL_SOURCE = { acoustic: 'measured (mic)', 'previous-session': 'from last session', stale: 'stale — recalibrate', none: 'not measured', reference: 'reference' };
+
+  /** Device's total audio latency estimate: reported output latency + extra measured acoustically. */
+  function latencyEstimate(s) {
+    if (s.outputLatencyMs == null) return null;
+    return s.outputLatencyMs - (s.calibrationMs || 0);
+  }
+
+  function correctionText(s) {
+    if (s.correctionRate == null) return '—';
+    const pct = (s.correctionRate - 1) * 100;
+    return `${pct >= 0 ? '+' : '−'}${Math.abs(pct).toFixed(3)} % (${s.correctionRate.toFixed(5)}×, ${s.correctionZone || '—'})`;
+  }
+
+  function stateOf(d) {
+    if (!d.connected) return 'DISCONNECTED';
+    return (d.status && d.status.syncState) || 'CONNECTING';
+  }
+
+  function renderDevPanel() {
+    const on = $('devMode').checked;
+    $('devPanel').hidden = !on;
+    if (!on) return;
+    const mt = clock.masterNow();
+    const time = new Date(mt).toISOString().slice(11, 23);
+    $('devHead').textContent = `Room ${room ? room.roomId : '—'} · Master clock ${time} UTC · Mode ${SYNC_PROFILES[syncProfile].label}` +
+      ` · tolerance ±${SYNC_PROFILES[syncProfile].syncedMs} ms · ${probeRunning ? 'acoustic probe running' : 'idle'}`;
+    const box = $('devCards');
+    box.innerHTML = '';
+    for (const d of devices) {
+      const s = d.status || {};
+      const card = document.createElement('div');
+      card.className = 'dev-card';
+      const h = document.createElement('h3');
+      const nm = document.createElement('span');
+      nm.textContent = `${d.role === 'master' ? '💻' : '📱'} ${d.name}`;
+      const st = document.createElement('span');
+      st.className = `state ${stateOf(d)}`;
+      st.textContent = d.role === 'master' ? `MASTER · ${stateOf(d)}` : stateOf(d);
+      h.append(nm, st);
+      const rows = [
+        ['Clock offset', s.offsetMs == null ? 'measuring…' : `${fmtMs(s.offsetMs, 1, true)} ± ${fmtMs(s.clockUncertaintyMs)}`],
+        ['Network RTT', `${fmtMs(s.rttMs)} (best ${fmtMs(s.bestRttMs)})`],
+        ['Clock drift', s.clockDriftPpm == null ? '—' : `${signed(s.clockDriftPpm, 0)} ppm`],
+        ['Audio latency', `${fmtMs(latencyEstimate(s), 0)} (reported ${fmtMs(s.outputLatencyMs, 0)})`],
+        ['Calibration', `${fmtMs(s.calibrationMs, 1, true)} — ${CAL_SOURCE[d.role === 'master' ? 'reference' : s.calibrationSource] || '—'}`],
+        ['Effective offset', fmtMs(s.trimMs, 1, true)],
+        ['Playback position', positionText(s)],
+        ['Playback drift', `${fmtMs(s.playbackDriftMs, 1, true)} / smoothed ${fmtMs(s.smoothedDriftMs, 1, true)}`],
+        ['Correction', correctionText(s)],
+        ['Learned skew', s.skewBiasPpm == null ? '—' : `${signed(s.skewBiasPpm, 0)} ppm`],
+        ['Resyncs / reconnects', `${s.resyncs ?? 0} / ${s.reconnects ?? 0}`],
+        ['Last clock sync', s.lastSyncAgeMs == null ? '—' : `${(s.lastSyncAgeMs / 1000).toFixed(1)} s ago (${s.clockSamples} samples)`],
+        ['Timing method', s.timingMethod || '—'],
+      ];
+      if (s.spatialOn) rows.push(['Spatial position', spatialText(d)]);
+      if (s.state === 'live') rows.push(['Live buffer', `${fmtMs(s.liveBufferMs, 0)} · ${s.liveLate || 0} late`]);
+      const dl = document.createElement('dl');
+      for (const [k, v] of rows) {
+        const dt = document.createElement('dt');
+        dt.textContent = k;
+        const dd = document.createElement('dd');
+        dd.textContent = v;
+        dl.append(dt, dd);
+      }
+      card.append(h, dl);
+      box.appendChild(card);
+    }
   }
 
   // ── Live mode ──
@@ -543,8 +862,10 @@
   document.querySelectorAll('input[name="mode"]').forEach((r) => {
     r.addEventListener('change', () => {
       const mode = selectedMode();
-      if (mode === 'file' && live.active) stopLive();
-      if (mode === 'live' && player.playback && player.playback.status === 'playing') conn.send({ type: 'stop' });
+      if (mode !== 'live' && live.active) stopLive();
+      if (mode !== 'file' && player.playback && player.playback.status === 'playing') conn.send({ type: 'stop' });
+      if (mode !== 'live') conn.send({ type: 'set-source', source: mode });
+      if (api.onModeChange) api.onModeChange(mode);
       render();
     });
   });
@@ -756,51 +1077,30 @@
     const list = $('deviceList');
     list.innerHTML = '';
     for (const d of devices) {
-      const li = document.createElement('li');
-      const name = document.createElement('span');
-      name.textContent = `${d.role === 'master' ? '💻' : '📱'} ${d.name}`;
-      const tag = document.createElement('span');
-      if (d.role === 'master') {
-        tag.className = 'tag master';
-        tag.textContent = 'MASTER';
-      } else if (d.connected) {
-        tag.className = 'tag ok';
-        tag.textContent = 'CONNECTED';
-      } else {
-        tag.className = 'tag bad';
-        tag.textContent = 'DISCONNECTED';
-      }
-      li.append(name, tag);
-      list.appendChild(li);
-    }
-
-    const tbody = $('diag').querySelector('tbody');
-    tbody.innerHTML = '';
-    for (const d of devices) {
       const s = d.status || {};
-      const ago = Math.round((Date.now() - d.lastSeen) / 1000);
-      const cells = [
-        `${d.role === 'master' ? '💻' : '📱'} ${d.name}`,
-        spatialText(d),
-        d.connected ? 'connected' : `disconnected (${ago}s)`,
-        deviceStateText(d),
-        positionText(s),
-        s.offsetMs != null ? `${signed(s.offsetMs, 1)} ms` : 'measuring…',
-        s.rttMs != null ? `${s.rttMs.toFixed(1)} ms` : '—',
-        driftText(s),
-        s.outputLatencyMs != null ? `${s.outputLatencyMs.toFixed(0)} ms${s.timingMethod ? ` (${s.timingMethod})` : ''}` : '—',
-      ];
-      const tr = document.createElement('tr');
-      for (const c of cells) {
-        const td = document.createElement('td');
-        td.textContent = c;
-        tr.appendChild(td);
-      }
-      tbody.appendChild(tr);
+      const li = document.createElement('li');
+      const left = document.createElement('span');
+      left.textContent = `${d.role === 'master' ? '💻' : '📱'} ${d.name}`;
+      const meta = document.createElement('span');
+      meta.className = 'meta';
+      const lat = latencyEstimate(s);
+      const drift = s.smoothedDriftMs ?? s.playbackDriftMs;
+      meta.textContent = d.connected
+        ? `Latency: ${lat == null ? '—' : `${lat.toFixed(0)} ms`} · Drift: ${drift == null ? '—' : `${signed(drift, 0)} ms`}` +
+          `${d.role === 'client' && s.calibrationSource === 'acoustic' ? ' · mic-calibrated' : ''}`
+        : `last seen ${Math.round((Date.now() - d.lastSeen) / 1000)} s ago`;
+      left.appendChild(meta);
+      const tag = document.createElement('span');
+      const st = d.role === 'master' ? 'MASTER' : stateOf(d);
+      tag.className = `state ${st}`;
+      tag.textContent = st;
+      li.append(left, tag);
+      list.appendChild(li);
     }
     renderReady();
     renderSpatialPanel();
     renderSummary();
+    renderDevPanel();
   }
 
   /**
@@ -827,13 +1127,6 @@
   function signed(v, digits) {
     const r = Number(v.toFixed(digits)) || 0; // avoid "-0"
     return `${r >= 0 ? '+' : ''}${r.toFixed(digits)}`;
-  }
-
-  function driftText(s) {
-    const parts = [];
-    if (s.clockDriftPpm != null) parts.push(`clock ${signed(s.clockDriftPpm, 0)} ppm`);
-    if (s.playbackDriftMs != null) parts.push(`playback ${signed(s.playbackDriftMs, 1)} ms`);
-    return parts.join(' · ') || '—';
   }
 
   function renderReady() {
@@ -879,6 +1172,8 @@
     $('liveStopBtn').disabled = !capturing && !live.active;
     $('liveSource').disabled = capturing;
     $('liveDevice').disabled = capturing;
+    $('calNow').disabled = probeRunning;
+    $('syncTest').disabled = probeRunning;
     renderPlayback();
   }
 
@@ -904,7 +1199,7 @@
     $('playState').textContent = state ? `· ${state}` : '';
 
     // Reached the end: stop the room so Play starts from the top next time.
-    if (pb && pb.status === 'playing' && dur && pos >= dur && autoStoppedSeq !== pb.seq) {
+    if (pb && pb.status === 'playing' && !pb.loop && dur && pos >= dur && autoStoppedSeq !== pb.seq) {
       autoStoppedSeq = pb.seq;
       conn.send({ type: 'stop' });
     }
@@ -919,6 +1214,11 @@
     if (!room) return;
     const status = buildStatus(clock, player, live.active ? live.receiver : undefined);
     if (renderer) Object.assign(status, renderer.status());
+    if (!clock.converged || probeRunning) status.syncState = 'CALIBRATING';
+    status.calibrationSource = 'reference'; // the laptop is what everyone is aligned to
+    status.calibrating = probeRunning;
+    status.reconnects = conn.reconnects;
+    if (api.extraStatus) Object.assign(status, api.extraStatus(status));
     conn.send({ type: 'status', status });
   }
   setInterval(reportStatus, 1000);
@@ -929,7 +1229,20 @@
   renderLiveHelp();
   renderSpatialPanel();
   // For poking at things from the browser console while experimenting.
-  window.syncwaveDebug = { player, clock, live, get renderer() { return renderer; } };
+  window.syncwaveDebug = { player, clock, live, recorder, calResults, get renderer() { return renderer; } };
+  Object.assign(api, {
+    conn, clock, player, calResults, signed, render, selectedMode, setSyncProfile,
+    devices: () => devices,
+    room: () => room,
+    syncProfile: () => syncProfile,
+    runAcoustic: (kind, ids) => runAcoustic(kind, ids),
+    probeRunning: () => probeRunning,
+  });
+  setSyncProfile('music');
+  applyLogInfo({ enabled: false });
+  // Re-open the microphone if auto-calibration was left on (works without a
+  // prompt once permission was granted for this page).
+  if ($('autoCal').checked) recorder.open().catch((err) => setCalMsg(micError(err), 'warn'));
   if (!window.isSecureContext) {
     setLiveMsg(`Live mode needs this page opened as http://localhost:${location.port || 80} on the laptop.`, 'warn');
   }
