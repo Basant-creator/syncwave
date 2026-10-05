@@ -214,7 +214,7 @@ In these runs the Master page was never painted (the test browser pane was hidde
 | **G** Phone joins mid-movie | Playing ~0.5 s after Enable Speaker, first error +0.8 ms, no resync. |
 | Wi-Fi drop (8 s, simulated) | Kept playing: error ≤ 0.4 ms during and after, reconnected as the same device, no resync. |
 | Video stalled ~80 ms (hidden page) | All devices followed the picture together (spread ≤ 2 ms) and re-locked within ~16 s by rate correction (80 ms is just under the explicit-resync limit). |
-| **D** 30 minutes | **Not completed**: stopped at 2 min 21 s on request (all three devices SYNCED at −0.1 ms at that point). The longest continuous movie run is the 10-minute test C; a 30-minute run is still to do. |
+| **D** 30 minutes | Continuous 30 min, laptop + 2 phones, no gradual drift, no resyncs after startup, no underruns. Device-to-device spread per 5-min window: median 0.7 → 4.5 ms, **max 6.9 ms**. Each device holds within the ±4 ms Movie deadband on its own, so two can sit up to ~8 ms apart. Sound vs video timeline: p95 3.4–4.4 ms in steady windows. During min 3:20–7:00 the (hidden) video stalled repeatedly in ~20 ms steps, +175 ms in total; all devices followed together and lagged the picture by up to 31 ms while catching up. |
 
 **Bugs found by these tests and fixed:**
 
@@ -619,4 +619,5 @@ syncwave/
 - **Compressed live audio** (Opus via WebCodecs) to cut bandwidth by about 10×.
 - **🎬 Movie Sync on real hardware:** test A–G with real phones and **by ear** (dialogue), and with the Master page visible (rVFC anchors). Measure the laptop display's own delay with the microphone and a light sensor, or by ear, to set a default lip-sync.
 - Faster recovery from video stalls (detect anchor jumps and re-align at once when the picture visibly jumped).
+- Tighter device-to-device agreement in Movie mode: the 30-min run showed devices drifting apart by up to 6.9 ms inside the ±4 ms deadband. Try a 2 ms deadband, or steer each device toward the group rather than only the timeline.
 - Time-stretching for speeds ≠ 1× on phones; compressed movie audio on the server.
